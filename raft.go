@@ -38,6 +38,40 @@ type LogEntry struct {
 	LogCMD   interface{}
 }
 
+type RequestVote struct {
+	Term        int
+	CandidateID int
+}
+
+type RequestVoteReply struct {
+	//当前任期号， 以便候选人去更新自己的任期号
+	Term int
+	//候选人赢得此张选票时为真
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderID int
+
+	// 新日志之前的索引
+	PrevLogIndex int
+	// PrevLogIndex 的任期号
+	PrevLogTerm int
+	// 准备存储的日志条目（表示心跳时为空）
+	Entries []LogEntry
+	// Leader 已经commit的索引值
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Success bool
+	Term    int
+
+	// 如果 Follower Index小于 Leader Index， 会告诉 Leader 下次开始发送的索引位置
+	NextIndex int
+}
+
 // Raft Node
 type Raft struct {
 	me int
@@ -67,67 +101,138 @@ type Raft struct {
 	toLeaderC  chan bool
 }
 
-// RequestVote rpc method
-func (rf *Raft) RequestVote(args VoteArgs, reply *VoteReply) error {
-
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-		return nil
+func (rf *Raft) getLastIndex() int {
+	rlen := len(rf.log)
+	if rlen == 0 {
+		return 0
 	}
-
-	if rf.votedFor == -1 {
-		rf.currentTerm = args.Term
-		rf.votedFor = args.CandidateID
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = true
-	}
-
-	return nil
+	return rf.log[rlen-1].LogIndex
 }
 
-// Heartbeat rpc method
-func (rf *Raft) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
-
-	// 如果 leader 节点小于当前节点 term
-	if args.Term < rf.currentTerm {
-		reply.Success = false
-		reply.Term = rf.currentTerm
-		return nil
+func (rf *Raft) getLastTerm() int {
+	rlen := len(rf.log)
+	if rlen == 0 {
+		return 0
 	}
-
-	// 如果只是 heartbeat
-	rf.heartbeatC <- true
-	if len(args.Entries) == 0 {
-		reply.Success = true
-		reply.Term = rf.currentTerm
-		return nil
-	}
-
-	// 如果有 entries
-	// leader 维护的 LogIndex 大于当前 Follower 的 LogIndex
-	// 代表当前 Follower 失联过，所以 Follower 要告知 Leader 它当前
-	// 的最大索引，以便下次心跳 Leader 返回
-	if args.PrevLogIndex > rf.getLastIndex() {
-		reply.Success = false
-		reply.Term = rf.currentTerm
-		reply.NextIndex = rf.getLastIndex() + 1
-		return nil
-	}
-
-	rf.log = append(rf.log, args.Entries...)
-	rf.commitIndex = rf.getLastIndex()
-	reply.Success = true
-	reply.Term = rf.currentTerm
-	reply.NextIndex = rf.getLastIndex() + 1
-
-	return nil
+	return rf.log[rlen-1].LogTerm
 }
 
+func (rf *Raft) broadcastRequestVote() {
+	var args = RequestVote{
+		Term:        rf.currentTerm,
+		CandidateID: rf.me,
+	}
+
+	for i := range rf.nodes {
+		go func(i int) {
+			var reply RequestVoteReply
+			rf.sendRequestVote(i, args, &reply)
+		}(i)
+	}
+}
+
+func (rf *Raft) sendRequestVote(serverID int, args RequestVote, reply *RequestVoteReply) {
+	client, err := rpc.DialHTTP("tcp", rf.nodes[serverID].address)
+	if err != nil {
+		log.Fatal("dialing: ", err)
+	}
+
+	defer func(client *rpc.Client) {
+		err := client.Close()
+		if err != nil {
+			log.Fatal("close client error: ", err)
+		}
+	}(client)
+	err = client.Call("Raft.RequestVote", args, reply)
+	if err != nil {
+		return
+	}
+
+	// 当前candidate节点无效
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.state = Follower
+		rf.votedFor = -1
+		return
+	}
+
+	if reply.VoteGranted {
+		rf.voteCount++
+	}
+
+	if rf.voteCount >= len(rf.nodes)/2+1 {
+		rf.toLeaderC <- true
+	}
+}
+
+func (rf *Raft) broadcastAppendEntries() {
+	for i := range rf.nodes {
+
+		var args AppendEntriesArgs
+		args.Term = rf.currentTerm
+		args.LeaderID = rf.me
+		args.LeaderCommit = rf.commitIndex
+
+		// 计算 preLogIndex 、preLogTerm
+		// 提取 preLogIndex - baseIndex 之后的entry，发送给 follower
+		prevLogIndex := rf.nextIndex[i] - 1
+		if rf.getLastIndex() > prevLogIndex {
+			args.PrevLogIndex = prevLogIndex
+			args.PrevLogTerm = rf.log[prevLogIndex].LogTerm
+			args.Entries = rf.log[prevLogIndex:]
+			log.Printf("send entries: %v\n", args.Entries)
+		}
+
+		go func(i int, args AppendEntriesArgs) {
+			var reply AppendEntriesReply
+			rf.sendAppendEntries(i, args, &reply)
+		}(i, args)
+	}
+}
+
+func (rf *Raft) sendAppendEntries(serverID int, args AppendEntriesArgs, reply *AppendEntriesReply) {
+	client, err := rpc.DialHTTP("tcp", rf.nodes[serverID].address)
+	if err != nil {
+		log.Fatal("dialing:", err)
+	}
+
+	defer func(client *rpc.Client) {
+		err := client.Close()
+		if err != nil {
+			log.Fatal("close client error: ", err)
+		}
+	}(client)
+	err = client.Call("Raft.Heartbeat", args, reply)
+	if err != nil {
+		return
+	}
+
+	// 如果 leader 节点落后于 follower 节点
+	if reply.Success {
+		if reply.NextIndex > 0 {
+			rf.nextIndex[serverID] = reply.NextIndex
+			rf.matchIndex[serverID] = rf.nextIndex[serverID] - 1
+		}
+	} else {
+		// 如果 leader 的 term 小于 follower 的 term， 需要将 leader 转变为 follower 重新选举
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.state = Follower
+			rf.votedFor = -1
+			return
+		}
+	}
+}
+
+// 把 Raft 对象 rf 注册到 RPC 服务，其他程序就可以通过 RPC 调用 Raft 的方法
 func (rf *Raft) rpc(port string) {
-	rpc.Register(rf)
-	rpc.HandleHTTP()
+	err := rpc.Register(rf)
+	if err != nil {
+		return
+	}
+	rpc.HandleHTTP() // 通过 HTTP 协议传输 RPC 数据
 	go func() {
+		// 创建一个 goroutine轻量级线程 来监听端口。
 		err := http.ListenAndServe(port, nil)
 		if err != nil {
 			log.Fatal("listen error: ", err)
@@ -135,19 +240,20 @@ func (rf *Raft) rpc(port string) {
 	}()
 }
 
+// 启动 raft
 func (rf *Raft) start() {
-	rf.state = Follower
+	rf.state = Follower // 初始状态为 Follower
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.heartbeatC = make(chan bool)
-	rf.toLeaderC = make(chan bool)
+	rf.heartbeatC = make(chan bool) // 应答心跳 创建通道
+	rf.toLeaderC = make(chan bool)  // 转变leader状态 创建通道
 
+	// 创建 goroutine 来处理 Raft 节点的状态转换和任务执行
 	go func() {
-
-		rand.Seed(time.Now().UnixNano())
-
+		rand.Seed(time.Now().UnixNano()) // 生成随机数种子
 		for {
 			switch rf.state {
+			// Follower: 监听来自 Leader 的心跳，如果一段时间内未收到心跳，就将自己的状态改为 Candidate。
 			case Follower:
 				select {
 				case <-rf.heartbeatC:
@@ -156,6 +262,7 @@ func (rf *Raft) start() {
 					log.Printf("follower-%d timeout\n", rf.me)
 					rf.state = Candidate
 				}
+			// Candidate: 向其他节点发送 RequestVote RPC，如果收到大多数节点的选票，就将自己的状态改为 Leader。
 			case Candidate:
 				fmt.Printf("Node: %d, I'm candidate\n", rf.me)
 				rf.currentTerm++
@@ -187,151 +294,11 @@ func (rf *Raft) start() {
 						}
 					}()
 				}
+			// Leader: 向其他节点广播心跳，维持 Leader 地位。
 			case Leader:
-				rf.broadcastHeartbeat()
+				rf.broadcastAppendEntries()
 				time.Sleep(100 * time.Millisecond)
 			}
 		}
 	}()
-}
-
-type VoteArgs struct {
-	Term        int
-	CandidateID int
-}
-
-type VoteReply struct {
-	//当前任期号， 以便候选人去更新自己的任期号
-	Term int
-	//候选人赢得此张选票时为真
-	VoteGranted bool
-}
-
-func (rf *Raft) broadcastRequestVote() {
-	var args = VoteArgs{
-		Term:        rf.currentTerm,
-		CandidateID: rf.me,
-	}
-
-	for i := range rf.nodes {
-		go func(i int) {
-			var reply VoteReply
-			rf.sendRequestVote(i, args, &reply)
-		}(i)
-	}
-}
-
-func (rf *Raft) sendRequestVote(serverID int, args VoteArgs, reply *VoteReply) {
-	client, err := rpc.DialHTTP("tcp", rf.nodes[serverID].address)
-	if err != nil {
-		log.Fatal("dialing: ", err)
-	}
-
-	defer client.Close()
-	client.Call("Raft.RequestVote", args, reply)
-
-	// 当前candidate节点无效
-	if reply.Term > rf.currentTerm {
-		rf.currentTerm = reply.Term
-		rf.state = Follower
-		rf.votedFor = -1
-		return
-	}
-
-	if reply.VoteGranted {
-		rf.voteCount++
-	}
-
-	if rf.voteCount >= len(rf.nodes)/2+1 {
-		rf.toLeaderC <- true
-	}
-}
-
-type HeartbeatArgs struct {
-	Term     int
-	LeaderID int
-
-	// 新日志之前的索引
-	PrevLogIndex int
-	// PrevLogIndex 的任期号
-	PrevLogTerm int
-	// 准备存储的日志条目（表示心跳时为空）
-	Entries []LogEntry
-	// Leader 已经commit的索引值
-	LeaderCommit int
-}
-
-type HeartbeatReply struct {
-	Success bool
-	Term    int
-
-	// 如果 Follower Index小于 Leader Index， 会告诉 Leader 下次开始发送的索引位置
-	NextIndex int
-}
-
-func (rf *Raft) broadcastHeartbeat() {
-	for i := range rf.nodes {
-
-		var args HeartbeatArgs
-		args.Term = rf.currentTerm
-		args.LeaderID = rf.me
-		args.LeaderCommit = rf.commitIndex
-
-		// 计算 preLogIndex 、preLogTerm
-		// 提取 preLogIndex - baseIndex 之后的entry，发送给 follower
-		prevLogIndex := rf.nextIndex[i] - 1
-		if rf.getLastIndex() > prevLogIndex {
-			args.PrevLogIndex = prevLogIndex
-			args.PrevLogTerm = rf.log[prevLogIndex].LogTerm
-			args.Entries = rf.log[prevLogIndex:]
-			log.Printf("send entries: %v\n", args.Entries)
-		}
-
-		go func(i int, args HeartbeatArgs) {
-			var reply HeartbeatReply
-			rf.sendHeartbeat(i, args, &reply)
-		}(i, args)
-	}
-}
-
-func (rf *Raft) sendHeartbeat(serverID int, args HeartbeatArgs, reply *HeartbeatReply) {
-	client, err := rpc.DialHTTP("tcp", rf.nodes[serverID].address)
-	if err != nil {
-		log.Fatal("dialing:", err)
-	}
-
-	defer client.Close()
-	client.Call("Raft.Heartbeat", args, reply)
-
-	// 如果 leader 节点落后于 follower 节点
-	if reply.Success {
-		if reply.NextIndex > 0 {
-			rf.nextIndex[serverID] = reply.NextIndex
-			rf.matchIndex[serverID] = rf.nextIndex[serverID] - 1
-		}
-	} else {
-		// 如果 leader 的 term 小于 follower 的 term， 需要将 leader 转变为 follower 重新选举
-		if reply.Term > rf.currentTerm {
-			rf.currentTerm = reply.Term
-			rf.state = Follower
-			rf.votedFor = -1
-			return
-		}
-	}
-}
-
-func (rf *Raft) getLastIndex() int {
-	rlen := len(rf.log)
-	if rlen == 0 {
-		return 0
-	}
-	return rf.log[rlen-1].LogIndex
-}
-
-func (rf *Raft) getLastTerm() int {
-	rlen := len(rf.log)
-	if rlen == 0 {
-		return 0
-	}
-	return rf.log[rlen-1].LogTerm
 }
