@@ -123,13 +123,18 @@ func (rf *Raft) broadcastRequestVote() {
 func (rf *Raft) sendRequestVote(serverID int, args RequestVoteArgs, reply *RequestVoteReply) {
 	client, err := rpc.DialHTTP("tcp", rf.nodes[serverID].address)
 	if err != nil {
-		log.Fatal("dialing: ", err)
+		//log.Fatal("dialing: ", err)
+		log.Print("dialing: ", err) // Use log.Print instead of log.Fatal
+		return
 	}
 
+	// defer 规定某个函数或者方法在执行结束后必须要执行的代码。
 	defer func(client *rpc.Client) {
-		err := client.Close()
-		if err != nil {
-			log.Fatal("close client error: ", err)
+		if client != nil { // Add check for nil client
+			err := client.Close()
+			if err != nil {
+				log.Print("close client error: ", err) // Use log.Print instead of log.Fatal
+			}
 		}
 	}(client)
 	err = client.Call("Raft.RequestVote", args, reply)
@@ -203,17 +208,23 @@ func (rf *Raft) broadcastAppendEntries() {
 func (rf *Raft) sendAppendEntries(serverID int, args AppendEntriesArgs, reply *AppendEntriesReply) {
 	client, err := rpc.DialHTTP("tcp", rf.nodes[serverID].address)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		//log.Fatal("dialing:", err)
+		log.Print("dialing:", err) // Use log.Print instead of log.Fatal
+		return
 	}
 
 	defer func(client *rpc.Client) {
-		err := client.Close()
-		if err != nil {
-			log.Fatal("close client error: ", err)
+		if client != nil {
+			err := client.Close()
+			if err != nil {
+				log.Print("close client error: ", err) // Use log.Print instead of log.Fatal
+			}
 		}
 	}(client)
+
 	err = client.Call("Raft.AppendEntries", args, reply)
 	if err != nil {
+		log.Print("call error: ", err) // Log the error and return
 		return
 	}
 
