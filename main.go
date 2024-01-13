@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"log"
 	"strings"
 )
 
@@ -13,6 +14,7 @@ func main() {
 
 	flag.Parse()
 	clusters := strings.Split(*cluster, ",")
+	log.Printf("port:%s, cluster:%v, ID:%d", *port, clusters, *id)
 
 	// 初始化一个 ns 的 map，key 是整数，value 是指针类型的 node。
 	ns := make(map[int]*node)

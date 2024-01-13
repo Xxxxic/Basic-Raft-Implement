@@ -31,45 +31,38 @@ const (
 	Leader
 )
 
-// LogEntry struct
+// 日志条目
 type LogEntry struct {
-	LogTerm  int
-	LogIndex int
-	LogCMD   interface{}
+	LogIndex int         // 日志条目索引
+	LogTerm  int         // 日志条目任期
+	LogCMD   interface{} // 操作命令
 }
 
-type RequestVote struct {
+type RequestVoteArgs struct {
 	Term        int
 	CandidateID int
 }
 
 type RequestVoteReply struct {
-	//当前任期号， 以便候选人去更新自己的任期号
-	Term int
-	//候选人赢得此张选票时为真
-	VoteGranted bool
+	Term        int  // 处理请求节点的任期号，用于候选者更新自己的任期
+	VoteGranted bool // 候选者获得选票时为 true; 否则为 false VoteGranted bool
 }
 
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderID int
 
-	// 新日志之前的索引
-	PrevLogIndex int
-	// PrevLogIndex 的任期号
-	PrevLogTerm int
-	// 准备存储的日志条目（表示心跳时为空）
-	Entries []LogEntry
-	// Leader 已经commit的索引值
-	LeaderCommit int
+	PrevLogIndex int        // 新日志之前的索引
+	PrevLogTerm  int        // PrevLogIndex 的任期号
+	Entries      []LogEntry // 需要复制的日志条目，用于发送心跳消息时 Entries 为空
+	LeaderCommit int        // Leader 已经commit的索引值
 }
 
 type AppendEntriesReply struct {
 	Success bool
 	Term    int
 
-	// 如果 Follower Index小于 Leader Index， 会告诉 Leader 下次开始发送的索引位置
-	NextIndex int
+	NextIndex int // 如果 Follower Index小于 Leader Index， 会告诉 Leader 下次开始发送的索引位置
 }
 
 // Raft Node
@@ -78,25 +71,19 @@ type Raft struct {
 
 	nodes map[int]*node
 
-	state       State
-	currentTerm int
-	votedFor    int
+	state       State // 服务器当前状态
+	currentTerm int   // 服务器当前已知的最新任期
+	votedFor    int   // 当前任期内收到选票的候选人ID
 	voteCount   int
 
-	// 日志条目集合
-	log []LogEntry
+	log []LogEntry // 状态机日志条目集合
 
-	// 被提交的最大索引
-	commitIndex int
-	// 被应用到状态机的最大索引
-	lastApplied int
+	commitIndex int   // 被提交的最大索引
+	lastApplied int   // 被应用到状态机的最大索引
+	nextIndex   []int // 保存需要发送给每个节点的下一个条目索引
+	matchIndex  []int // 保存已经复制给每个节点日志的最高索引
 
-	// 保存需要发送给每个节点的下一个条目索引
-	nextIndex []int
-	// 保存已经复制给每个节点日志的最高索引
-	matchIndex []int
-
-	// channels
+	// channels: 在 Go 中被用作协程（goroutine）之间的通信机制
 	heartbeatC chan bool
 	toLeaderC  chan bool
 }
@@ -117,8 +104,9 @@ func (rf *Raft) getLastTerm() int {
 	return rf.log[rlen-1].LogTerm
 }
 
+// 广播 RequestVoteArgs RPC
 func (rf *Raft) broadcastRequestVote() {
-	var args = RequestVote{
+	var args = RequestVoteArgs{
 		Term:        rf.currentTerm,
 		CandidateID: rf.me,
 	}
@@ -131,7 +119,8 @@ func (rf *Raft) broadcastRequestVote() {
 	}
 }
 
-func (rf *Raft) sendRequestVote(serverID int, args RequestVote, reply *RequestVoteReply) {
+// 发送 RequestVoteArgs RPC
+func (rf *Raft) sendRequestVote(serverID int, args RequestVoteArgs, reply *RequestVoteReply) {
 	client, err := rpc.DialHTTP("tcp", rf.nodes[serverID].address)
 	if err != nil {
 		log.Fatal("dialing: ", err)
@@ -148,7 +137,7 @@ func (rf *Raft) sendRequestVote(serverID int, args RequestVote, reply *RequestVo
 		return
 	}
 
-	// 当前candidate节点无效
+	// 当前candidate节点无效：收到比自己大的任期号 将自己的状态重置为 Follower
 	if reply.Term > rf.currentTerm {
 		rf.currentTerm = reply.Term
 		rf.state = Follower
@@ -156,18 +145,38 @@ func (rf *Raft) sendRequestVote(serverID int, args RequestVote, reply *RequestVo
 		return
 	}
 
+	// 收到选票：得票数加1
 	if reply.VoteGranted {
 		rf.voteCount++
 	}
 
+	// 如果收到大多数节点的选票，就将自己的状态改为 Leader
 	if rf.voteCount >= len(rf.nodes)/2+1 {
 		rf.toLeaderC <- true
 	}
 }
 
+// RequestVote rpc method
+func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return nil
+	}
+
+	if rf.votedFor == -1 {
+		rf.currentTerm = args.Term
+		rf.votedFor = args.CandidateID
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = true
+	}
+
+	return nil
+}
+
+// 广播 AppendEntries RPC
 func (rf *Raft) broadcastAppendEntries() {
 	for i := range rf.nodes {
-
 		var args AppendEntriesArgs
 		args.Term = rf.currentTerm
 		args.LeaderID = rf.me
@@ -190,6 +199,7 @@ func (rf *Raft) broadcastAppendEntries() {
 	}
 }
 
+// 发送 AppendEntries RPC
 func (rf *Raft) sendAppendEntries(serverID int, args AppendEntriesArgs, reply *AppendEntriesReply) {
 	client, err := rpc.DialHTTP("tcp", rf.nodes[serverID].address)
 	if err != nil {
@@ -202,7 +212,7 @@ func (rf *Raft) sendAppendEntries(serverID int, args AppendEntriesArgs, reply *A
 			log.Fatal("close client error: ", err)
 		}
 	}(client)
-	err = client.Call("Raft.Heartbeat", args, reply)
+	err = client.Call("Raft.AppendEntries", args, reply)
 	if err != nil {
 		return
 	}
@@ -222,6 +232,44 @@ func (rf *Raft) sendAppendEntries(serverID int, args AppendEntriesArgs, reply *A
 			return
 		}
 	}
+}
+
+// AppendEntries rpc method
+func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+
+	// 如果 leader 节点小于当前节点 term
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return nil
+	}
+
+	// 如果只是 AppendEntries RPC 心跳
+	rf.heartbeatC <- true
+	if len(args.Entries) == 0 {
+		reply.Success = true
+		reply.Term = rf.currentTerm
+		return nil
+	}
+
+	// 如果有 entries
+	// leader 维护的 LogIndex 大于当前 Follower 的 LogIndex
+	// 代表当前 Follower 失联过，所以 Follower 要告知 Leader 它当前
+	// 的最大索引，以便下次心跳 Leader 返回
+	if args.PrevLogIndex > rf.getLastIndex() {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		reply.NextIndex = rf.getLastIndex() + 1
+		return nil
+	}
+
+	rf.log = append(rf.log, args.Entries...)
+	rf.commitIndex = rf.getLastIndex()
+	reply.Success = true
+	reply.Term = rf.currentTerm
+	reply.NextIndex = rf.getLastIndex() + 1
+
+	return nil
 }
 
 // 把 Raft 对象 rf 注册到 RPC 服务，其他程序就可以通过 RPC 调用 Raft 的方法
@@ -262,17 +310,19 @@ func (rf *Raft) start() {
 					log.Printf("follower-%d timeout\n", rf.me)
 					rf.state = Candidate
 				}
-			// Candidate: 向其他节点发送 RequestVote RPC，如果收到大多数节点的选票，就将自己的状态改为 Leader。
+			// Candidate: 向其他节点发送 RequestVoteArgs RPC，如果收到大多数节点的选票，就将自己的状态改为 Leader。
 			case Candidate:
 				fmt.Printf("Node: %d, I'm candidate\n", rf.me)
 				rf.currentTerm++
 				rf.votedFor = rf.me
 				rf.voteCount = 1
-				go rf.broadcastRequestVote()
+				go rf.broadcastRequestVote() // 广播发起投票请求，开始选举。
 
 				select {
+				// 如果在一个随机的时间间隔（300ms-500ms）后没有达到 Leader 状态，那么就回退到 Follower 状态。
 				case <-time.After(time.Duration(rand.Intn(500-300)+300) * time.Millisecond):
 					rf.state = Follower
+				// 如果收到大多数节点的选票，就将自己的状态改为 Leader。
 				case <-rf.toLeaderC:
 					fmt.Printf("Node: %d, I'm leader\n", rf.me)
 					rf.state = Leader
