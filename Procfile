@@ -1,6 +1,9 @@
-# Use goreman to run `go get github.com/mattn/goreman`
-test1: ./simple-raft --id 1 --cluster 127.0.0.1:22379,127.0.0.1:32379 --port :12379
-test2: ./simple-raft --id 2 --cluster 127.0.0.1:12379,127.0.0.1:32379 --port :22379
-test3: ./simple-raft --id 3 --cluster 127.0.0.1:12379,127.0.0.1:22379 --port :32379
-test4: ./simple-raft --id 4 --cluster 127.0.0.1:12379,127.0.0.1:22379 --port :32380
-test5: ./simple-raft --id 5 --cluster 127.0.0.1:12379,127.0.0.1:22379 --port :32381
+test1: ./raftTest --id 1 --cluster 127.0.0.1:2222,127.0.0.1:3333 --port :1111
+test2: ./raftTest --id 2 --cluster 127.0.0.1:1111,127.0.0.1:3333 --port :2222
+test3: ./raftTest --id 3 --cluster 127.0.0.1:1111,127.0.0.1:2222 --port :3333
+
+# test1: ./raftTest --id 1 --cluster 127.0.0.1:2222,127.0.0.1:3333,127.0.0.1:4444,127.0.0.1:5555 --port :1111
+# test2: ./raftTest --id 2 --cluster 127.0.0.1:1111,127.0.0.1:3333,127.0.0.1:4444,127.0.0.1:5555 --port :2222
+# test3: ./raftTest --id 3 --cluster 127.0.0.1:1111,127.0.0.1:2222,127.0.0.1:4444,127.0.0.1:5555 --port :3333
+# test4: ./raftTest --id 4 --cluster 127.0.0.1:1111,127.0.0.1:2222,127.0.0.1:3333,127.0.0.1:5555 --port :4444
+# test5: ./raftTest --id 5 --cluster 127.0.0.1:1111,127.0.0.1:2222,127.0.0.1:3333,127.0.0.1:4444 --port :5555

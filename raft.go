@@ -18,6 +18,7 @@ type node struct {
 func newNode(address string) *node {
 	node := &node{}
 	node.address = address
+	node.connect = true // 默认连接上
 	return node
 }
 
@@ -104,6 +105,17 @@ func (rf *Raft) getLastTerm() int {
 	return rf.log[rlen-1].LogTerm
 }
 
+// 获得当前存活节点数
+func (rf *Raft) getAliveNodeCount() int {
+	count := 1
+	for _, node := range rf.nodes {
+		if node.connect {
+			count++
+		}
+	}
+	return count
+}
+
 // 广播 RequestVoteArgs RPC
 func (rf *Raft) broadcastRequestVote() {
 	var args = RequestVoteArgs{
@@ -112,6 +124,9 @@ func (rf *Raft) broadcastRequestVote() {
 	}
 
 	for i := range rf.nodes {
+		if rf.nodes[i].connect == false {
+			continue
+		}
 		go func(i int) {
 			var reply RequestVoteReply
 			rf.sendRequestVote(i, args, &reply)
@@ -125,7 +140,9 @@ func (rf *Raft) sendRequestVote(serverID int, args RequestVoteArgs, reply *Reque
 	if err != nil {
 		//log.Fatal("dialing: ", err)
 		log.Print("dialing: ", err) // Use log.Print instead of log.Fatal
-		return
+
+		// 将连接不上的节点移出集群
+		rf.nodes[serverID].connect = false
 	}
 
 	// defer 规定某个函数或者方法在执行结束后必须要执行的代码。
@@ -137,38 +154,49 @@ func (rf *Raft) sendRequestVote(serverID int, args RequestVoteArgs, reply *Reque
 			}
 		}
 	}(client)
-	err = client.Call("Raft.RequestVote", args, reply)
-	if err != nil {
-		return
-	}
 
-	// 当前candidate节点无效：收到比自己大的任期号 将自己的状态重置为 Follower
-	if reply.Term > rf.currentTerm {
-		rf.currentTerm = reply.Term
-		rf.state = Follower
-		rf.votedFor = -1
-		return
-	}
+	// 连接上节点就发请求
+	if err == nil {
+		err = client.Call("Raft.RequestVote", args, reply)
+		if err != nil {
+			return
+		}
 
-	// 收到选票：得票数加1
-	if reply.VoteGranted {
-		rf.voteCount++
+		log.Print("sendRequestVote: ", reply)
+		log.Print("My currentTerm: ", rf.currentTerm)
+		// 收到比自己大的任期号 将自己的状态重置为 Follower
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.state = Follower
+			rf.votedFor = -1
+			return
+		}
+
+		// 收到选票：得票数加1
+		if reply.VoteGranted {
+			rf.voteCount++
+		}
 	}
 
 	// 如果收到大多数节点的选票，就将自己的状态改为 Leader
-	if rf.voteCount >= len(rf.nodes)/2+1 {
+	//if rf.voteCount >= len(rf.nodes)/2+1 {
+	log.Print("My voteCount: ", rf.voteCount)
+	log.Print("Alive node count: ", rf.getAliveNodeCount())
+	if rf.voteCount >= (rf.getAliveNodeCount()+1)/2 {
 		rf.toLeaderC <- true
 	}
 }
 
 // RequestVote rpc method
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+	// 如果收到的任期号小于自己的任期号，就拒绝投票
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return nil
 	}
 
+	// 没有投票过 就把票投给它
 	if rf.votedFor == -1 {
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateID
@@ -176,6 +204,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error
 		reply.VoteGranted = true
 	}
 
+	// 如果已经投过票了，就拒绝投票
 	return nil
 }
 
@@ -210,15 +239,14 @@ func (rf *Raft) sendAppendEntries(serverID int, args AppendEntriesArgs, reply *A
 	if err != nil {
 		//log.Fatal("dialing:", err)
 		log.Print("dialing:", err) // Use log.Print instead of log.Fatal
+		// 连接不上就返回
 		return
 	}
 
 	defer func(client *rpc.Client) {
-		if client != nil {
-			err := client.Close()
-			if err != nil {
-				log.Print("close client error: ", err) // Use log.Print instead of log.Fatal
-			}
+		err := client.Close()
+		if err != nil {
+			log.Print("close client error: ", err) // Use log.Print instead of log.Fatal
 		}
 	}(client)
 
@@ -247,7 +275,6 @@ func (rf *Raft) sendAppendEntries(serverID int, args AppendEntriesArgs, reply *A
 
 // AppendEntries rpc method
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
-
 	// 如果 leader 节点小于当前节点 term
 	if args.Term < rf.currentTerm {
 		reply.Success = false
@@ -316,7 +343,7 @@ func (rf *Raft) start() {
 			case Follower:
 				select {
 				case <-rf.heartbeatC:
-					log.Printf("follower-%d recived heartbeat\n", rf.me)
+					// log.Printf("follower-%d recived heartbeat\n", rf.me)
 				case <-time.After(time.Duration(rand.Intn(500-300)+300) * time.Millisecond):
 					log.Printf("follower-%d timeout\n", rf.me)
 					rf.state = Candidate
@@ -351,14 +378,14 @@ func (rf *Raft) start() {
 						for {
 							i++
 							rf.log = append(rf.log, LogEntry{rf.currentTerm, i, fmt.Sprintf("user send : %d", i)})
-							time.Sleep(3 * time.Second)
+							time.Sleep(5 * time.Second)
 						}
 					}()
 				}
 			// Leader: 向其他节点广播心跳，维持 Leader 地位。
 			case Leader:
 				rf.broadcastAppendEntries()
-				time.Sleep(100 * time.Millisecond)
+				time.Sleep(200 * time.Millisecond)
 			}
 		}
 	}()
